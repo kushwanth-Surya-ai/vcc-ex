@@ -1,0 +1,279 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── CSS Variables mirroring Tailwind tokens ─── */
+:root {
+  --bg-default:    #0a0f1e;
+  --bg-card:       #1a2035;
+  --bg-border:     #2a3050;
+  --bg-hover:      #1e2845;
+
+  --accent-cyan:   #00d4ff;
+  --accent-purple: #7c3aed;
+  --accent-green:  #10b981;
+  --accent-amber:  #f59e0b;
+  --accent-red:    #ef4444;
+  --accent-blue:   #3b82f6;
+
+  --text-primary:   #f1f5f9;
+  --text-secondary: #94a3b8;
+  --text-muted:     #475569;
+
+  --chart-car:     #00d4ff;
+  --chart-bike:    #7c3aed;
+  --chart-heavy:   #f59e0b;
+  --chart-bus:     #10b981;
+  --chart-bicycle: #f97316;
+
+  --sidebar-width-expanded: 260px;
+  --sidebar-width-collapsed: 72px;
+  --transition-speed: 250ms;
+}
+
+/* ─── Base Reset ─── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: var(--bg-default);
+  color: var(--text-primary);
+  min-height: 100vh;
+  overflow-x: hidden;
+  position: relative;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: 
+    radial-gradient(circle at 15% 15%, rgba(0, 212, 255, 0.04), transparent 45%),
+    radial-gradient(circle at 85% 85%, rgba(124, 58, 237, 0.05), transparent 45%),
+    linear-gradient(rgba(42, 48, 80, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(42, 48, 80, 0.08) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 30px 30px, 30px 30px;
+  pointer-events: none;
+  z-index: -1;
+}
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ─── Page Mount Transition ─── */
+@keyframes pageMount {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.page-mount {
+  animation: pageMount 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ─── Custom Scrollbar ─── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-default);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--bg-border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-cyan);
+  box-shadow: 0 0 8px var(--accent-cyan);
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-border) var(--bg-default);
+}
+
+/* ─── Smooth Transitions ─── */
+.transition-sidebar {
+  transition: width var(--transition-speed) cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ─── Glassmorphism utility ─── */
+.glass {
+  background: rgba(26, 32, 53, 0.65);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(42, 48, 80, 0.5);
+}
+
+/* ─── Gradient Text ─── */
+.gradient-text {
+  background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* ─── Glow borders ─── */
+.glow-cyan {
+  box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.3), 0 0 20px rgba(0, 212, 255, 0.1);
+}
+.glow-purple {
+  box-shadow: 0 0 0 1px rgba(124, 58, 237, 0.3), 0 0 20px rgba(124, 58, 237, 0.1);
+}
+.glow-green {
+  box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.3), 0 0 20px rgba(16, 185, 129, 0.1);
+}
+.glow-amber {
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.3), 0 0 20px rgba(245, 158, 11, 0.1);
+}
+
+/* ─── Recharts custom overrides ─── */
+.recharts-tooltip-wrapper .recharts-default-tooltip {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--bg-border) !important;
+  border-radius: 8px !important;
+}
+
+.recharts-cartesian-grid line {
+  stroke: var(--bg-border) !important;
+  stroke-opacity: 0.5;
+}
+
+.recharts-text {
+  fill: var(--text-secondary) !important;
+}
+
+/* ─── Loading skeleton shimmer ─── */
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-card) 25%,
+    var(--bg-hover) 50%,
+    var(--bg-card) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s infinite;
+  border-radius: 6px;
+}
+
+/* ─── Count-up animation ─── */
+@keyframes countUpFade {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0);    }
+}
+
+.count-up-animate {
+  animation: countUpFade 0.5s ease-out forwards;
+}
+
+/* ─── Alert toast slide-in ─── */
+@keyframes slideInFromRight {
+  from { transform: translateX(110%); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+
+.toast-slide-in {
+  animation: slideInFromRight 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ─── Pulse for live indicators ─── */
+@keyframes livePulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.5; transform: scale(1.3); }
+}
+
+.live-pulse {
+  animation: livePulse 1.5s ease-in-out infinite;
+}
+
+/* ─── Progress bar fill animation ─── */
+@keyframes progressFill {
+  from { width: 0%; }
+  to   { width: var(--target-width, 100%); }
+}
+
+.progress-bar-animate {
+  animation: progressFill 1.2s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* ─── Chart area gradient ─── */
+.chart-gradient-cyan {
+  fill: url(#gradientCyan);
+}
+
+/* ─── Sidebar nav active glow ─── */
+.nav-active {
+  background: linear-gradient(90deg, rgba(0, 212, 255, 0.12), rgba(124, 58, 237, 0.05)) !important;
+  border-left: 3px solid var(--accent-cyan) !important;
+  box-shadow: inset 3px 0 12px rgba(0, 212, 255, 0.12) !important;
+  color: var(--accent-cyan) !important;
+}
+.nav-active svg {
+  color: var(--accent-cyan) !important;
+  filter: drop-shadow(0 0 3px rgba(0, 212, 255, 0.6)) !important;
+}
+
+/* ─── Card glow on hover ─── */
+.card-hover-glow:hover {
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(0, 212, 255, 0.2),
+    0 0 24px rgba(0, 212, 255, 0.08);
+  transform: translateY(-1px);
+  transition: all 0.25s ease;
+}
+
+/* ─── Heatmap cell ─── */
+.heatmap-cell {
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.heatmap-cell:hover {
+  transform: scale(1.15);
+  z-index: 10;
+  box-shadow: 0 0 8px rgba(0, 212, 255, 0.5);
+}
+
+/* ─── Input focus ring override ─── */
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.4);
+}
+
+/* ─── Select appearance ─── */
+select {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* ─── Table ─── */
+table {
+  border-collapse: collapse;
+}
+
+/* ─── Recharts legend ─── */
+.recharts-legend-item-text {
+  color: var(--text-secondary) !important;
+  font-size: 12px !important;
+}

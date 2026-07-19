@@ -1,0 +1,19 @@
+{
+  "name": "vcc-system",
+  "version": "1.0.0",
+  "description": "Vehicle Counting & Classification System",
+  "scripts": {
+    "setup": "npm install concurrently --no-save && npm run setup:backend && npm run setup:frontend && npm run setup:detection",
+    "setup:backend": "cd backend && python -m venv venv && .\\venv\\Scripts\\python.exe -m pip install -r requirements.txt && .\\venv\\Scripts\\python.exe create_db.py && .\\venv\\Scripts\\alembic upgrade head",
+    "setup:frontend": "cd frontend && npm install",
+    "setup:detection": "cd detection && python -m venv venv && .\\venv\\Scripts\\python.exe -m pip install -r requirements.txt",
+    "dev": "npx concurrently -c \"blue,green,magenta\" -n \"BACKEND,FRONTEND,DETECTION\" \"npm run dev:backend\" \"npm run dev:frontend\" \"npm run dev:detection\"",
+    "dev:backend": "cd backend && .\\venv\\Scripts\\uvicorn main:app --reload --port 8000",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:detection": ".\\backend\\venv\\Scripts\\python.exe start_detection.py",
+    "seed": "cd detection && .\\venv\\Scripts\\python.exe seed_demo.py"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

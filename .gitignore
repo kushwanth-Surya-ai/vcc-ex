@@ -1,0 +1,43 @@
+# --- Secrets: never commit ---
+.env
+*.env
+!.env.example
+backend/.env
+frontend/.env
+detection/.env
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+.pytest_cache/
+*.egg-info/
+
+# --- Node ---
+node_modules/
+frontend/dist/
+frontend/node_modules/
+
+# --- Model weights (large binaries; distribute out-of-band) ---
+*.pt
+*.onnx
+*.engine
+*.tflite
+
+# --- Vendored Windows GStreamer DLLs (platform-specific, ~102 files) ---
+detection/bin/
+
+# --- Training + runtime artifacts ---
+backend/runs/
+backend/training_data/
+runs/
+uploads/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
