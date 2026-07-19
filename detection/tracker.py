@@ -277,54 +277,143 @@ class ThreadedRTSPCapture:
         self.latest_frame = None
         self.ret = False
         self.running = True
+        # Monotonic sequence number: incremented once per *newly decoded* frame.
+        # Consumers compare against the seq they last saw to tell a fresh frame
+        # from a repeat of the one they already tracked.
+        self.frame_seq = 0
+        self._last_read_seq = -1
+        self._pending_set: list[tuple[int, float]] = []
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._update_loop, daemon=True)
         self.thread.start()
 
-    def isOpened(self) -> bool:
+    # -- capture handle access ---------------------------------------------
+    # The lock is held ONLY to hand out / swap the capture reference and the
+    # frame slot.  No blocking decode ever happens under it.
+
+    def _cap_ref(self) -> Any:
         with self.lock:
-            return self.cap is not None and self.cap.isOpened()
+            return self.cap
+
+    def isOpened(self) -> bool:
+        cap = self._cap_ref()
+        try:
+            return cap is not None and cap.isOpened()
+        except Exception:
+            return False
 
     def get(self, prop_id: int) -> float:
+        cap = self._cap_ref()
+        try:
+            if cap is not None and cap.isOpened():
+                return cap.get(prop_id)
+        except Exception:
+            pass
+        return 0.0
+
+    def set(self, prop_id: int, value: float) -> bool:
+        """
+        Queue a property change (e.g. ``CAP_PROP_POS_FRAMES`` rewind).
+
+        The change is applied by the reader thread between two reads rather than
+        inline: calling ``cap.set()`` from another thread while a decode is in
+        flight is not safe with the FFMPEG backend.
+        """
         with self.lock:
-            if self.cap is not None and self.cap.isOpened():
-                return self.cap.get(prop_id)
-            return 0.0
+            if self.cap is None:
+                return False
+            self._pending_set.append((prop_id, value))
+        return True
 
     def _update_loop(self) -> None:
-        while self.running:
-            with self.lock:
-                if not self.running or self.cap is None or not self.cap.isOpened():
+        try:
+            while self.running:
+                cap = self._cap_ref()
+                if cap is None:
                     time.sleep(0.05)
                     continue
                 try:
-                    ret, frame = self.cap.read()
+                    if not cap.isOpened():
+                        time.sleep(0.05)
+                        continue
+                except Exception:
+                    time.sleep(0.05)
+                    continue
+
+                # Apply any queued property changes (rewind, etc.) in-thread.
+                with self.lock:
+                    pending, self._pending_set = self._pending_set, []
+                for prop_id, value in pending:
+                    try:
+                        cap.set(prop_id, value)
+                    except Exception:
+                        logger.debug("Capture set(%s, %s) failed", prop_id, value)
+
+                # ---- BLOCKING network decode happens OUTSIDE the lock -------
+                try:
+                    ret, frame = cap.read()
                 except Exception:
                     ret, frame = False, None
 
-            if ret and frame is not None:
-                with self.lock:
-                    self.latest_frame = frame
-                    self.ret = True
-            else:
-                time.sleep(0.01)
+                if ret and frame is not None:
+                    with self.lock:
+                        if not self.running:
+                            break
+                        self.latest_frame = frame
+                        self.ret = True
+                        self.frame_seq += 1
+                else:
+                    time.sleep(0.01)
+        finally:
+            # The reader thread owns teardown, so a release() that races with an
+            # in-flight read() can never free the capture out from under us.
+            self._close_cap()
 
     def read(self) -> tuple[bool, np.ndarray | None]:
+        """cv2-compatible read.  Returns the latest frame, fresh or not."""
+        ret, frame, _is_new = self.read_with_freshness()
+        return ret, frame
+
+    def read_with_freshness(self) -> tuple[bool, np.ndarray | None, bool]:
+        """
+        Like :meth:`read` but also reports whether the frame is *new*.
+
+        ``is_new`` is False when the reader thread has not decoded anything
+        since the previous call — re-running the tracker on such a frame would
+        feed ByteTrack a duplicate observation and corrupt its Kalman motion
+        model.
+        """
         with self.lock:
-            if self.latest_frame is not None:
-                return self.ret, self.latest_frame.copy()
-            return False, None
+            if self.latest_frame is None:
+                return False, None, False
+            is_new = self.frame_seq != self._last_read_seq
+            self._last_read_seq = self.frame_seq
+            return self.ret, self.latest_frame.copy(), is_new
+
+    def _close_cap(self) -> None:
+        """Idempotently release the underlying capture."""
+        with self.lock:
+            cap, self.cap = self.cap, None
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
     def release(self) -> None:
         self.running = False
-        with self.lock:
-            if self.cap is not None:
-                try:
-                    if self.cap.isOpened():
-                        self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
+        thread = self.thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            # Wait for any in-flight decode to finish; the reader thread then
+            # releases the capture itself in its finally block.
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                logger.warning(
+                    "Capture reader thread still blocked in read(); "
+                    "deferring release to that thread."
+                )
+                return
+        self._close_cap()
 
 
 
@@ -433,24 +522,55 @@ async def run_camera(
         target_fps = float(os.getenv("VCC_TARGET_FPS", "10.0"))
         target_delay = 1.0 / target_fps if target_fps > 0 else 0
 
+        # Reconnect backoff: 1 s doubling to RECONNECT_MAX_BACKOFF.  A camera
+        # that is permanently dead must not spin at 1 Hz forever, nor flood the
+        # log with one warning per attempt.
+        RECONNECT_BASE_BACKOFF = 1.0
+        RECONNECT_MAX_BACKOFF  = 30.0
+        backoff        = RECONNECT_BASE_BACKOFF
+        fail_streak    = 0
+
         try:
             while True:
                 start_time = asyncio.get_event_loop().time()
 
-
-
-                ret, frame = await loop.run_in_executor(None, cap.read)
+                reader = getattr(cap, "read_with_freshness", None)
+                if reader is not None:
+                    ret, frame, is_new = await loop.run_in_executor(None, reader)
+                else:
+                    # GStreamerCapture.read() blocks on its own frame queue, so
+                    # every successful read is new by construction.
+                    ret, frame = await loop.run_in_executor(None, cap.read)
+                    is_new = ret
 
                 if not ret:
                     # If we reached the end of a video file, loop back
                     if not using_native_gst and str(source_parsed).endswith(('.mp4', '.avi', '.mkv')):
                         if hasattr(cap, "set"):
                             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        # Always yield — without this the rewind path is a hot
+                        # busy-loop that starves the event loop.
+                        await asyncio.sleep(0.05)
                         continue
 
-                    logger.warning("[%s] Frame read failed -- retrying in 1 s.", camera_id)
-                    await asyncio.sleep(1.0)
-                    cap.release()
+                    fail_streak += 1
+                    # Log every attempt for the first few, then decreasingly
+                    # often, so a dead camera does not flood the log.
+                    if fail_streak <= 3 or fail_streak % 10 == 0:
+                        logger.warning(
+                            "[%s] Frame read failed (attempt %d) -- retrying in %.1f s.",
+                            camera_id, fail_streak, backoff,
+                        )
+                    else:
+                        logger.debug(
+                            "[%s] Frame read failed (attempt %d) -- retrying in %.1f s.",
+                            camera_id, fail_streak, backoff,
+                        )
+
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2.0, RECONNECT_MAX_BACKOFF)
+
+                    await loop.run_in_executor(None, cap.release)
 
                     # Reconnect using the same path that originally worked
                     if using_native_gst:
@@ -468,7 +588,18 @@ async def run_camera(
                         cap = await loop.run_in_executor(None, lambda: ThreadedRTSPCapture(source_parsed))
                     continue
 
+                # Recovered — reset the backoff ladder.
+                if fail_streak:
+                    logger.info("[%s] Capture recovered after %d failed attempts.", camera_id, fail_streak)
+                    fail_streak = 0
+                    backoff     = RECONNECT_BASE_BACKOFF
 
+                if not is_new:
+                    # Inference is outrunning capture.  Re-tracking the same
+                    # frame would feed ByteTrack a duplicate observation, so
+                    # yield briefly and wait for a genuinely new frame instead.
+                    await asyncio.sleep(0.005)
+                    continue
 
                 frame_h = frame.shape[0]
 

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 import cv2
 import numpy as np
@@ -59,13 +60,30 @@ logging.basicConfig(
 _BOUNDARY = b"--VCCFrame"
 _CRLF     = b"\r\n"
 
+# ---------------------------------------------------------------------------
+# aiohttp application keys (AppKey where available, plain str on aiohttp < 3.9)
+# ---------------------------------------------------------------------------
+try:
+    _BROADCASTERS: Any = web.AppKey("vcc_broadcasters", dict)
+    _FRAME_QUEUES: Any = web.AppKey("vcc_frame_queues", dict)
+except AttributeError:                      # pragma: no cover - older aiohttp
+    _BROADCASTERS = "vcc_broadcasters"
+    _FRAME_QUEUES = "vcc_frame_queues"
+
 
 # ---------------------------------------------------------------------------
 # Static placeholder frame for cameras not yet streaming
 # ---------------------------------------------------------------------------
 
+_PLACEHOLDER_CACHE: dict[str, bytes] = {}
+
+
 def _make_placeholder(camera_id: str, w: int = 640, h: int = 360) -> bytes:
     """Return a JPEG-encoded grey placeholder frame with a status message."""
+    cached = _PLACEHOLDER_CACHE.get(camera_id)
+    if cached is not None:
+        return cached
+
     img = np.full((h, w, 3), 40, dtype=np.uint8)
     cv2.putText(
         img,
@@ -78,7 +96,121 @@ def _make_placeholder(camera_id: str, w: int = 640, h: int = 360) -> bytes:
         cv2.LINE_AA,
     )
     _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    data = buf.tobytes()
+    _PLACEHOLDER_CACHE[camera_id] = data
+    return data
+
+
+# ---------------------------------------------------------------------------
+# JPEG encoding (executed off the event loop)
+# ---------------------------------------------------------------------------
+
+def _encode_jpeg(frame_np: np.ndarray, quality: int = 80) -> bytes | None:
+    """Encode *frame_np* to JPEG bytes.  Runs in a worker thread, never inline."""
+    ok, buf = cv2.imencode(".jpg", frame_np, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        return None
     return buf.tobytes()
+
+
+# ---------------------------------------------------------------------------
+# Per-camera broadcaster: ONE queue consumer, ONE encode, N viewers
+# ---------------------------------------------------------------------------
+
+class _CameraBroadcaster:
+    """
+    Fan-out hub for a single camera.
+
+    Exactly one task per camera consumes ``frame_queues[camera_id]`` and encodes
+    each frame to JPEG once (in the default executor).  The resulting immutable
+    ``bytes`` object is then handed to every currently-connected viewer, so N
+    viewers cost ONE encode and no viewer steals another viewer's frames.
+
+    Each subscriber owns a one-slot queue.  A viewer that has not picked up its
+    previous frame simply loses it — a slow client can never stall the
+    broadcaster or any other client.
+    """
+
+    def __init__(self, camera_id: str, queue: asyncio.Queue) -> None:
+        self.camera_id    = camera_id
+        self.queue        = queue
+        self.subscribers: set[asyncio.Queue[bytes]] = set()
+        self.latest_jpeg: bytes | None = None
+        self._task: asyncio.Task | None = None
+
+    # -- subscription management -------------------------------------------
+
+    def subscribe(self) -> asyncio.Queue[bytes]:
+        """Register a new viewer and (re)start the broadcast task if needed."""
+        sub: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
+        self.subscribers.add(sub)
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(
+                self._run(), name=f"mjpeg-broadcast-{self.camera_id}"
+            )
+            logger.debug("Broadcaster started: camera_id=%s", self.camera_id)
+        return sub
+
+    def unsubscribe(self, sub: asyncio.Queue[bytes]) -> None:
+        """Drop a viewer; stop the broadcast task once the last one leaves."""
+        self.subscribers.discard(sub)
+        if not self.subscribers:
+            self.stop()
+
+    def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+            logger.debug("Broadcaster stopped: camera_id=%s", self.camera_id)
+
+    # -- broadcast loop -----------------------------------------------------
+
+    async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                frame_np = await self.queue.get()
+                # Offload the (CPU-bound, ~ms) encode so the event loop — which
+                # also runs the counting logic — is never blocked by it.
+                jpeg = await loop.run_in_executor(None, _encode_jpeg, frame_np, 80)
+                if jpeg is None:
+                    logger.warning("JPEG encode failed: camera_id=%s", self.camera_id)
+                    continue
+                self.latest_jpeg = jpeg
+                self._publish(jpeg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Broadcaster crashed: camera_id=%s", self.camera_id)
+
+    def _publish(self, jpeg: bytes) -> None:
+        """Hand the shared JPEG to every viewer, dropping frames for laggards."""
+        for sub in list(self.subscribers):
+            if sub.full():
+                try:
+                    sub.get_nowait()      # this client is behind — drop its stale frame
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                sub.put_nowait(jpeg)
+            except asyncio.QueueFull:
+                pass
+
+
+def _get_broadcaster(
+    request:   web.Request,
+    camera_id: str,
+) -> _CameraBroadcaster | None:
+    """Return (creating on demand) the broadcaster for *camera_id*, or None."""
+    registry: dict[str, _CameraBroadcaster] = request.app[_BROADCASTERS]
+    bcast = registry.get(camera_id)
+    if bcast is None:
+        queue = request.app[_FRAME_QUEUES].get(camera_id)
+        if queue is None:
+            return None
+        bcast = _CameraBroadcaster(camera_id, queue)
+        registry[camera_id] = bcast
+    return bcast
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +227,10 @@ async def _mjpeg_handler(
     The response uses ``multipart/x-mixed-replace`` so browsers and
     OpenCV ``VideoCapture`` clients can consume it directly without any
     additional client-side logic.
+
+    Viewers do NOT consume the camera queue themselves — they subscribe to the
+    camera's ``_CameraBroadcaster``, so any number of tabs can watch the same
+    camera at full frame rate.
     """
     camera_id = request.match_info["camera_id"]
 
@@ -111,29 +247,23 @@ async def _mjpeg_handler(
     await response.prepare(request)
 
     placeholder = _make_placeholder(camera_id)
-    queue       = frame_queues.get(camera_id)
+    bcast       = _get_broadcaster(request, camera_id)
+    sub         = bcast.subscribe() if bcast is not None else None
 
     logger.info(
-        "MJPEG stream started: camera_id=%s  peer=%s",
+        "MJPEG stream started: camera_id=%s  peer=%s  viewers=%d",
         camera_id, request.remote,
+        len(bcast.subscribers) if bcast is not None else 0,
     )
 
     try:
         while True:
             frame_bytes: bytes
 
-            if queue is not None:
+            if sub is not None:
                 try:
-                    frame_np = await asyncio.wait_for(queue.get(), timeout=5.0)
-                    logger.debug(
-                        "Frame received for camera_id=%s  shape=%s",
-                        camera_id, frame_np.shape,
-                    )
-                    _, buf   = cv2.imencode(
-                        ".jpg", frame_np,
-                        [cv2.IMWRITE_JPEG_QUALITY, 80],
-                    )
-                    frame_bytes = buf.tobytes()
+                    # Already-encoded JPEG, shared with every other viewer.
+                    frame_bytes = await asyncio.wait_for(sub.get(), timeout=5.0)
                 except asyncio.TimeoutError:
                     # No new frame yet — send placeholder to keep connection alive
                     frame_bytes = placeholder
@@ -151,8 +281,15 @@ async def _mjpeg_handler(
             )
             await response.write(part_header + frame_bytes + _CRLF)
 
-    except (ConnectionResetError, asyncio.CancelledError):
+    except ConnectionResetError:
         logger.info("MJPEG stream closed: camera_id=%s", camera_id)
+    except asyncio.CancelledError:
+        # Must propagate so start_detection.py's task.cancel() still works.
+        logger.info("MJPEG stream cancelled: camera_id=%s", camera_id)
+        raise
+    finally:
+        if bcast is not None and sub is not None:
+            bcast.unsubscribe(sub)
 
     return response
 
@@ -185,15 +322,48 @@ async def _snapshot_handler(
     request:      web.Request,
     frame_queues: dict[str, asyncio.Queue],
 ) -> web.Response:
-    """Return a single JPEG snapshot of the latest frame in the queue without consuming it."""
+    """Return a single JPEG snapshot of the most recent frame for *camera_id*."""
     camera_id = request.match_info["camera_id"]
     queue = frame_queues.get(camera_id)
+
+    # Preferred source: the frame the broadcaster encoded most recently.  Costs
+    # nothing and never touches the camera queue.
+    registry: dict[str, _CameraBroadcaster] = request.app[_BROADCASTERS]
+    bcast = registry.get(camera_id)
+    if bcast is not None and bcast.latest_jpeg is not None:
+        return web.Response(
+            body=bcast.latest_jpeg,
+            content_type="image/jpeg",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
     if queue is not None and not queue.empty():
         try:
-            # Peek at the most recent frame in the queue's collection deque
-            frame_np = queue._queue[-1]
-            _, buf = cv2.imencode(".jpg", frame_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            return web.Response(body=buf.tobytes(), content_type="image/jpeg", headers={"Access-Control-Allow-Origin": "*"})
+            # No broadcaster running (nobody is streaming this camera).  Take the
+            # newest queued frame through the public API and put it straight
+            # back, so we neither reach into asyncio.Queue internals nor leave
+            # the queue emptier than we found it.  Older frames are stale by
+            # definition — the producer already drops them under back-pressure.
+            frame_np = None
+            while True:
+                try:
+                    frame_np = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            if frame_np is None:
+                raise RuntimeError("queue emptied concurrently")
+            try:
+                queue.put_nowait(frame_np)
+            except asyncio.QueueFull:      # pragma: no cover - queue was drained
+                pass
+
+            loop = asyncio.get_running_loop()
+            body = await loop.run_in_executor(None, _encode_jpeg, frame_np, 90)
+            if body is None:
+                raise RuntimeError("JPEG encode failed")
+            return web.Response(body=body, content_type="image/jpeg", headers={"Access-Control-Allow-Origin": "*"})
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.error("Snapshot error: %s", exc)
             return web.json_response({"error": str(exc)}, status=500)
@@ -228,6 +398,15 @@ def build_app(frame_queues: dict[str, asyncio.Queue]) -> web.Application:
         the tracker inference loop.
     """
     app = web.Application()
+    app[_FRAME_QUEUES] = frame_queues
+    app[_BROADCASTERS] = {}
+
+    async def _shutdown_broadcasters(app: web.Application) -> None:
+        for bcast in app[_BROADCASTERS].values():
+            bcast.stop()
+
+    app.on_cleanup.append(_shutdown_broadcasters)
+
     app.router.add_get("/health", _health_handler)
     app.router.add_get(
         "/",
