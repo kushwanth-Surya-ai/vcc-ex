@@ -705,6 +705,12 @@ async def run_camera(
                     "[%s] Cannot open source '%s'. Camera task exiting.",
                     camera_id, source,
                 )
+                # An uploaded video that cannot be opened is never going to
+                # succeed on a retry. Without this the supervisor sees the task
+                # exit, respawns it 5 s later and the row reads 'processing'
+                # forever -- a silent infinite loop instead of a visible failure.
+                if single_pass:
+                    await _report_video_complete(http_client, camera_id, "failed")
                 return
 
         # Inspect stream codec
@@ -778,7 +784,15 @@ async def run_camera(
                     # the old check listed only .mp4/.avi/.mkv, so an uploaded .mov
                     # or .webm fell through to the reconnect ladder and was treated
                     # as a dead camera.
-                    if not using_native_gst and is_file_source:
+                    # Native GStreamer needs an extra test to get here. Its read()
+                    # returns (False, None) both at real EOS and on a transient
+                    # queue timeout, and only EOS clears isOpened() -- so without
+                    # that check a merely slow decoder would be mistaken for the
+                    # end of the clip. Restricted to single_pass because a looping
+                    # demo source cannot rewind a dead pipeline with cap.set(); it
+                    # relies on the reconnect ladder below to reopen and replay.
+                    gst_upload_eos = using_native_gst and single_pass and not cap.isOpened()
+                    if is_file_source and (not using_native_gst or gst_upload_eos):
                         eof_streak += 1
                         # Require a few consecutive failures before declaring the
                         # file finished, so one transient decode hiccup mid-clip
