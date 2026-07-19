@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 import cv2
@@ -59,6 +60,10 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 _BOUNDARY = b"--VCCFrame"
 _CRLF     = b"\r\n"
+
+#: Max age of a broadcaster's cached JPEG before /snapshot ignores it and reads
+#: the live queue instead.
+_SNAPSHOT_MAX_AGE = 2.0
 
 # ---------------------------------------------------------------------------
 # aiohttp application keys (AppKey where available, plain str on aiohttp < 3.9)
@@ -129,14 +134,33 @@ class _CameraBroadcaster:
     Each subscriber owns a one-slot queue.  A viewer that has not picked up its
     previous frame simply loses it — a slow client can never stall the
     broadcaster or any other client.
+
+    The broadcaster deliberately holds the *frame_queues registry*, not a queue
+    object.  ``start_detection.monitor_cameras_loop`` pops and re-creates a
+    camera's queue on every source change, crash or delete; a captured queue
+    object would leave this task awaiting an orphan forever and every viewer of
+    that camera stuck on the placeholder until the process restarted.
     """
 
-    def __init__(self, camera_id: str, queue: asyncio.Queue) -> None:
+    #: How long to wait on one queue before re-resolving it from the registry.
+    QUEUE_REFRESH_INTERVAL = 1.0
+
+    def __init__(
+        self,
+        camera_id:    str,
+        frame_queues: dict[str, asyncio.Queue],
+    ) -> None:
         self.camera_id    = camera_id
-        self.queue        = queue
+        self.frame_queues = frame_queues
         self.subscribers: set[asyncio.Queue[bytes]] = set()
         self.latest_jpeg: bytes | None = None
+        self.latest_jpeg_ts: float = 0.0
         self._task: asyncio.Task | None = None
+
+    @property
+    def is_live(self) -> bool:
+        """True while the broadcast task is actually consuming the queue."""
+        return self._task is not None and not self._task.done()
 
     # -- subscription management -------------------------------------------
 
@@ -169,14 +193,33 @@ class _CameraBroadcaster:
         loop = asyncio.get_running_loop()
         try:
             while True:
-                frame_np = await self.queue.get()
+                # Re-resolve every iteration: the pipeline may have been
+                # restarted and the queue swapped out underneath us.
+                queue = self.frame_queues.get(self.camera_id)
+                if queue is None:
+                    # Pipeline is down (camera deleted or restarting).  Viewers
+                    # fall back to the placeholder; pick the queue up when the
+                    # coordinator re-creates it.
+                    await asyncio.sleep(self.QUEUE_REFRESH_INTERVAL)
+                    continue
+
+                try:
+                    frame_np = await asyncio.wait_for(
+                        queue.get(), timeout=self.QUEUE_REFRESH_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    # Bounded wait, so a queue replaced while we were blocked is
+                    # noticed on the next pass instead of never.
+                    continue
+
                 # Offload the (CPU-bound, ~ms) encode so the event loop — which
                 # also runs the counting logic — is never blocked by it.
                 jpeg = await loop.run_in_executor(None, _encode_jpeg, frame_np, 80)
                 if jpeg is None:
                     logger.warning("JPEG encode failed: camera_id=%s", self.camera_id)
                     continue
-                self.latest_jpeg = jpeg
+                self.latest_jpeg    = jpeg
+                self.latest_jpeg_ts = time.monotonic()
                 self._publish(jpeg)
         except asyncio.CancelledError:
             raise
@@ -203,12 +246,13 @@ def _get_broadcaster(
 ) -> _CameraBroadcaster | None:
     """Return (creating on demand) the broadcaster for *camera_id*, or None."""
     registry: dict[str, _CameraBroadcaster] = request.app[_BROADCASTERS]
+    frame_queues: dict[str, asyncio.Queue] = request.app[_FRAME_QUEUES]
     bcast = registry.get(camera_id)
     if bcast is None:
-        queue = request.app[_FRAME_QUEUES].get(camera_id)
-        if queue is None:
+        if camera_id not in frame_queues:
             return None
-        bcast = _CameraBroadcaster(camera_id, queue)
+        # Hand over the registry, not the queue: see _CameraBroadcaster.
+        bcast = _CameraBroadcaster(camera_id, frame_queues)
         registry[camera_id] = bcast
     return bcast
 
@@ -328,9 +372,19 @@ async def _snapshot_handler(
 
     # Preferred source: the frame the broadcaster encoded most recently.  Costs
     # nothing and never touches the camera queue.
+    #
+    # Only usable while the broadcaster is LIVE and its cached frame is recent.
+    # stop() leaves the broadcaster (and its last JPEG) in the registry, so an
+    # unguarded preference here served one frozen frame forever, for the rest of
+    # the process lifetime, to every /snapshot caller.
     registry: dict[str, _CameraBroadcaster] = request.app[_BROADCASTERS]
     bcast = registry.get(camera_id)
-    if bcast is not None and bcast.latest_jpeg is not None:
+    if (
+        bcast is not None
+        and bcast.latest_jpeg is not None
+        and bcast.is_live
+        and (time.monotonic() - bcast.latest_jpeg_ts) <= _SNAPSHOT_MAX_AGE
+    ):
         return web.Response(
             body=bcast.latest_jpeg,
             content_type="image/jpeg",

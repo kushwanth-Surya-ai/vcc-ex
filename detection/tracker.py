@@ -271,7 +271,17 @@ class ThreadedRTSPCapture:
     """Dedicated background thread for OpenCV RTSP VideoCapture.
     Reads frames continuously at full network speed (~25 FPS) into a single-slot buffer.
     Prevents FFmpeg RTSP socket buffer overflow, packet drops, and H.265 reference frame corruption."""
-    def __init__(self, source_parsed: int | str):
+    # Health states reported by :meth:`health`.
+    CONNECTING = "connecting"   # no frame decoded yet, still inside the grace window
+    OK         = "ok"           # a frame arrived recently enough
+    STALLED    = "stalled"      # was/should be streaming, nothing arriving -> reconnect
+
+    def __init__(
+        self,
+        source_parsed: int | str,
+        first_frame_timeout: float | None = None,
+        stall_timeout: float | None = None,
+    ):
         self.source_parsed = source_parsed
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|buffer_size;10240000|max_delay;500000"
         self.cap = cv2.VideoCapture(source_parsed, cv2.CAP_FFMPEG)
@@ -284,6 +294,25 @@ class ThreadedRTSPCapture:
         self.frame_seq = 0
         self._last_read_seq = -1
         self._pending_set: list[tuple[int, float]] = []
+        # Liveness bookkeeping.  ``opened_at`` starts the first-frame grace
+        # window; ``last_frame_ts`` drives stall detection once streaming began.
+        self.opened_at = time.monotonic()
+        self.last_frame_ts: float | None = None
+        # A camera that is slow to hand over its first frame (H.265 keyframe
+        # interval, TCP negotiation, DHCP-slow NVR) must NOT be torn down while
+        # it is still negotiating -- that used to livelock the reconnect ladder.
+        self.first_frame_timeout = (
+            first_frame_timeout
+            if first_frame_timeout is not None
+            else float(os.getenv("VCC_FIRST_FRAME_TIMEOUT", "20.0"))
+        )
+        # Once frames HAVE been flowing, silence this long means the stream is
+        # dead even though cap.read() may keep failing quietly forever.
+        self.stall_timeout = (
+            stall_timeout
+            if stall_timeout is not None
+            else float(os.getenv("VCC_STALL_TIMEOUT", "5.0"))
+        )
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._update_loop, daemon=True)
         self.thread.start()
@@ -324,6 +353,11 @@ class ThreadedRTSPCapture:
             if self.cap is None:
                 return False
             self._pending_set.append((prop_id, value))
+            # A deliberate seek (e.g. rewinding a finished .mp4) interrupts the
+            # stream on purpose, so restart the liveness clock instead of
+            # letting the gap it creates look like a stall.
+            self.opened_at    = time.monotonic()
+            self.last_frame_ts = None
         return True
 
     def _update_loop(self) -> None:
@@ -363,7 +397,13 @@ class ThreadedRTSPCapture:
                         self.latest_frame = frame
                         self.ret = True
                         self.frame_seq += 1
+                        self.last_frame_ts = time.monotonic()
                 else:
+                    # ``ret`` must track the CURRENT health of the capture, not
+                    # "did we ever succeed".  Leaving it latched True made the
+                    # whole reconnect ladder in run_camera() unreachable.
+                    with self.lock:
+                        self.ret = False
                     time.sleep(0.01)
         finally:
             # The reader thread owns teardown, so a release() that races with an
@@ -389,7 +429,37 @@ class ThreadedRTSPCapture:
                 return False, None, False
             is_new = self.frame_seq != self._last_read_seq
             self._last_read_seq = self.frame_seq
-            return self.ret, self.latest_frame.copy(), is_new
+            # A single failed cap.read() between two good ones is normal (packet
+            # loss, decoder warm-up).  Only sustained silence counts as a
+            # failure, so a blip does not trip the reconnect ladder.
+            ret = self.ret or self._health_locked() == self.OK
+            return ret, self.latest_frame.copy(), is_new
+
+    # -- liveness ----------------------------------------------------------
+
+    def _health_locked(self) -> str:
+        """``self.lock`` must be held.  See :meth:`health`."""
+        now = time.monotonic()
+        if self.last_frame_ts is None:
+            # Nothing has ever been decoded.  Be patient until the grace window
+            # expires -- tearing the capture down here is what caused a
+            # slow-to-start camera to loop forever without ever streaming.
+            if (now - self.opened_at) < self.first_frame_timeout:
+                return self.CONNECTING
+            return self.STALLED
+        if (now - self.last_frame_ts) >= self.stall_timeout:
+            return self.STALLED
+        return self.OK
+
+    def health(self) -> str:
+        """
+        Current liveness of the capture: ``CONNECTING`` / ``OK`` / ``STALLED``.
+
+        This is what distinguishes "no frame yet, still negotiating" (wait) from
+        "frames were flowing and stopped" (reconnect).
+        """
+        with self.lock:
+            return self._health_locked()
 
     def _close_cap(self) -> None:
         """Idempotently release the underlying capture."""
@@ -415,6 +485,45 @@ class ThreadedRTSPCapture:
                 )
                 return
         self._close_cap()
+
+
+def _capture_health(cap: Any) -> str:
+    """
+    Liveness of *cap* for captures that expose :meth:`ThreadedRTSPCapture.health`.
+
+    Captures without it (``GStreamerCapture``) block on their own frame queue, so
+    a falsy read from them already means the pipeline is dead -> ``STALLED``.
+    """
+    probe = getattr(cap, "health", None)
+    if probe is None:
+        return ThreadedRTSPCapture.STALLED
+    try:
+        return probe()
+    except Exception:
+        return ThreadedRTSPCapture.STALLED
+
+
+def _release_capture_in_background(cap: Any, camera_id: str) -> None:
+    """
+    Release *cap* off the event loop, without waiting for it.
+
+    ``release()`` joins the reader thread for up to 5 s.  Calling it inline from
+    a ``finally`` block stalled every other camera and the MJPEG streamer for
+    that long on each restart.  A plain daemon thread is used rather than
+    ``run_in_executor`` because this runs during task cancellation, where
+    awaiting anything re-raises ``CancelledError`` immediately and the loop may
+    already be shutting down.
+    """
+    def _do_release() -> None:
+        try:
+            cap.release()
+        except Exception:
+            logger.debug("[%s] Capture release raised; ignoring.", camera_id)
+        logger.info("[%s] Capture released.", camera_id)
+
+    threading.Thread(
+        target=_do_release, name=f"cap-release-{camera_id}", daemon=True
+    ).start()
 
 
 
@@ -528,8 +637,9 @@ async def run_camera(
         # log with one warning per attempt.
         RECONNECT_BASE_BACKOFF = 1.0
         RECONNECT_MAX_BACKOFF  = 30.0
-        backoff        = RECONNECT_BASE_BACKOFF
-        fail_streak    = 0
+        backoff          = RECONNECT_BASE_BACKOFF
+        fail_streak      = 0
+        connecting_logged = False
 
         try:
             while True:
@@ -545,6 +655,22 @@ async def run_camera(
                     is_new = ret
 
                 if not ret:
+                    health = _capture_health(cap)
+
+                    if health == ThreadedRTSPCapture.CONNECTING:
+                        # No frame has EVER arrived and the grace window is still
+                        # open.  Releasing the capture here would tear down a
+                        # connection that is mid-negotiation, and the doubling
+                        # backoff would then keep a slow camera off-air forever.
+                        if not connecting_logged:
+                            logger.info(
+                                "[%s] Waiting for first frame from source...",
+                                camera_id,
+                            )
+                            connecting_logged = True
+                        await asyncio.sleep(0.2)
+                        continue
+
                     # If we reached the end of a video file, loop back
                     if not using_native_gst and str(source_parsed).endswith(('.mp4', '.avi', '.mkv')):
                         if hasattr(cap, "set"):
@@ -587,6 +713,9 @@ async def run_camera(
                             using_native_gst = False
                     else:
                         cap = await loop.run_in_executor(None, lambda: ThreadedRTSPCapture(source_parsed))
+                    # The replacement capture gets its own first-frame grace
+                    # window, so let it announce itself again.
+                    connecting_logged = False
                     continue
 
                 # Recovered — reset the backoff ladder.
@@ -594,6 +723,7 @@ async def run_camera(
                     logger.info("[%s] Capture recovered after %d failed attempts.", camera_id, fail_streak)
                     fail_streak = 0
                     backoff     = RECONNECT_BASE_BACKOFF
+                connecting_logged = False
 
                 if not is_new:
                     # Inference is outrunning capture.  Re-tracking the same
@@ -704,8 +834,9 @@ async def run_camera(
 
 
         finally:
-            cap.release()
-            logger.info("[%s] Capture released.", camera_id)
+            # Non-blocking: release() joins the reader thread for up to 5 s and
+            # this runs on the event loop during task cancellation.
+            _release_capture_in_background(cap, camera_id)
 
 
 # ---------------------------------------------------------------------------
