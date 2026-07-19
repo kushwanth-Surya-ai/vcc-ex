@@ -94,6 +94,39 @@ def step_1_env_files():
             path.write_text(text, encoding="utf-8")
             say(f"  generated secrets in {name}")
 
+    _warn_if_stream_url_points_at_the_api()
+
+
+def _warn_if_stream_url_points_at_the_api():
+    """Flag a frontend/.env whose stream URL points at the backend, not the streamer.
+
+    An .env that already exists is left untouched above, by design - it may hold
+    deliberate local overrides. But one specific wrong value is worth shouting
+    about, because releases of .env.example shipped it: VITE_STREAM_BASE_URL set
+    to the API port. The backend serves no /stream/{camera_id}, so every live
+    preview 404s and the UI reports "stream unavailable" - which reads as a
+    broken detection pipeline rather than a one-line config typo, and sends
+    people debugging YOLO, OpenCV and upload paths instead.
+    """
+    path = ROOT / "frontend" / ".env"
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("#") or not line.startswith("VITE_STREAM_BASE_URL="):
+            continue
+        value = line.split("=", 1)[1].strip()
+        if value.rstrip("/").endswith(":8000"):
+            say("")
+            say("  WARNING: frontend/.env sets VITE_STREAM_BASE_URL to the API port:")
+            say(f"    {line}")
+            say("  The MJPEG streamer is a separate server on port 8001. Live previews")
+            say("  (uploaded videos and cameras) will show 'stream unavailable' until")
+            say("  this is changed to http://localhost:8001 - then restart Vite, which")
+            say("  only reads .env at startup.")
+            say("")
+        return
+
 
 def step_2_venv():
     say("Step 2/6: backend virtualenv (shared with detection)")
