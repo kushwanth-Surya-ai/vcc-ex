@@ -26,7 +26,85 @@ def log_reader(pipe, prefix, color_code):
     except Exception:
         pass
 
+def read_env_file(env_path):
+    """Minimal KEY=VALUE reader for backend/.env.
+
+    Deliberately not python-dotenv: this launcher runs on the *system*
+    interpreter before any virtualenv is active, so it cannot assume any
+    third-party package is importable.
+    """
+    settings = {}
+    if not os.path.isfile(env_path):
+        return settings
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                settings[key.strip()] = value.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return settings
+
+
+def find_gstreamer_root(explicit=""):
+    """Locate a Windows GStreamer installation, or return "" if there is none.
+
+    Only meaningful on Windows. A POSIX install (Homebrew, apt) puts its
+    libraries and typelibs where the system loader already looks, so the
+    PATH/GI_TYPELIB_PATH injection below is a Windows-specific need.
+
+    This used to be one developer's absolute home directory, which meant
+    GStreamer silently failed to load on every other machine and the pipeline
+    quietly fell back to FFMPEG. Checked in order:
+
+      1. VCC_GSTREAMER_ROOT -- explicit override, from the environment or
+         backend/.env, for a non-standard install location.
+      2. GSTREAMER_1_0_ROOT_* -- set by the official Windows installer itself,
+         which is what makes this work on an unseen machine with no config.
+      3. The default install paths, for an installer run that did not export
+         its variables into the current shell.
+    """
+    if os.name != "nt":
+        return ""
+
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    for var in (
+        "VCC_GSTREAMER_ROOT",
+        "GSTREAMER_1_0_ROOT_MSVC_X86_64",
+        "GSTREAMER_1_0_ROOT_MINGW_X86_64",
+        "GSTREAMER_1_0_ROOT_X86_64",
+    ):
+        value = os.environ.get(var)
+        if value:
+            candidates.append(value)
+
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    for base in (r"C:\gstreamer", os.path.join(local_appdata, "Programs", "gstreamer")):
+        if not base:
+            continue
+        for flavour in ("msvc_x86_64", "mingw_x86_64"):
+            candidates.append(os.path.join(base, "1.0", flavour))
+
+    for root in candidates:
+        if root and os.path.isdir(os.path.join(root, "bin")):
+            return root
+    return ""
+
+
 def main():
+    # -- Color codes --
+    cyan = "\033[36m"
+    green = "\033[32m"
+    yellow = "\033[33m"
+    magenta = "\033[35m"
+    red = "\033[31m"
+    reset = "\033[0m"
+
     # Locate virtualenv python
     venv_python = (
         os.path.join("backend", "venv", "Scripts", "python.exe")
@@ -37,44 +115,37 @@ def main():
         # Fall back to sys.executable if virtualenv not found
         venv_python = sys.executable
 
-    # Check for GStreamer disable option in backend/.env
-    disable_gst = False
-    env_path = os.path.join("backend", ".env")
-    if os.path.isfile(env_path):
-        try:
-            with open(env_path, "r") as f:
-                for line in f:
-                    if line.strip().startswith("VCC_DISABLE_GST"):
-                        parts = line.strip().split("=")
-                        if len(parts) >= 2:
-                            disable_gst = parts[1].strip().lower() == "true"
-        except Exception:
-            pass
+    # Check for GStreamer settings in backend/.env
+    env_file = read_env_file(os.path.join("backend", ".env"))
+    disable_gst = env_file.get("VCC_DISABLE_GST", "").lower() == "true"
 
     # Setup GStreamer path configuration for detection subprocess
-    gst_root = r"C:\Users\Charan Galla\AppData\Local\Programs\gstreamer\1.0\msvc_x86_64"
-    gst_bin = os.path.join(gst_root, "bin")
-    gst_typelibs = os.path.join(gst_root, "lib", "girepository-1.0")
+    gst_root = "" if disable_gst else find_gstreamer_root(env_file.get("VCC_GSTREAMER_ROOT", ""))
     local_bin = os.path.abspath(os.path.join("detection", "bin"))
 
     # Copy current environment and update paths for child processes
     env = os.environ.copy()
     env["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|buffer_size;10240000|max_delay;500000"
-    if not disable_gst and os.path.isdir(gst_bin):
-        env["PATH"] = gst_bin + os.pathsep + local_bin + os.pathsep + env.get("PATH", "")
-        env["GI_TYPELIB_PATH"] = gst_typelibs
+    if gst_root:
+        env["PATH"] = (
+            os.path.join(gst_root, "bin") + os.pathsep + local_bin + os.pathsep + env.get("PATH", "")
+        )
+        env["GI_TYPELIB_PATH"] = os.path.join(gst_root, "lib", "girepository-1.0")
+        print(f"{yellow}[SYSTEM] GStreamer found at {gst_root}.{reset}")
+    elif disable_gst:
+        print(f"{yellow}[SYSTEM] GStreamer disabled via VCC_DISABLE_GST -- using FFMPEG capture.{reset}")
+    elif os.name == "nt":
+        # Say so out loud. Silence here is what made the old hardcoded path
+        # look like it worked: the pipeline degrades to FFMPEG and the only
+        # symptom is different decode behaviour much later.
+        print(
+            f"{yellow}[SYSTEM] No GStreamer installation found -- using FFMPEG capture. "
+            f"Set VCC_GSTREAMER_ROOT in backend/.env to override.{reset}"
+        )
 
 
 
     processes = []
-
-    # -- Color codes --
-    cyan = "\033[36m"
-    green = "\033[32m"
-    yellow = "\033[33m"
-    magenta = "\033[35m"
-    red = "\033[31m"
-    reset = "\033[0m"
 
     print("=" * 70)
     print(f"{cyan}VCC UNIFIED SERVICE LAUNCHER{reset}")
