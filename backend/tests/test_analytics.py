@@ -40,9 +40,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 # ---------------------------------------------------------------------------
 
 # Default to a throwaway SQLite file so the suite runs with no database server.
-# Export DATABASE_URL before running pytest to test against PostgreSQL instead.
+# Set VCC_TEST_DATABASE_URL to run these against PostgreSQL instead.
+# Deliberately NOT keyed on DATABASE_URL: that name is commonly exported
+# machine-wide for an unrelated project, and setdefault() would then let a
+# foreign database win -- these tests create and drop tables.
 _TEST_DB_FILE = os.path.join(tempfile.gettempdir(), "vcc_test_analytics.db")
-os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{_TEST_DB_FILE}")
+os.environ["DATABASE_URL"] = os.getenv("VCC_TEST_DATABASE_URL") or f"sqlite+aiosqlite:///{_TEST_DB_FILE}"
 os.environ.setdefault("JWT_SECRET", "test-secret-that-is-long-enough-for-hs256-algorithm-padding-ok")
 os.environ.setdefault("JWT_ALGORITHM", "HS256")
 os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "15")

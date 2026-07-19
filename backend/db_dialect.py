@@ -113,6 +113,73 @@ DEFAULT_DATABASE_URL = "sqlite+aiosqlite:///./vcc.db"
 # ---------------------------------------------------------------------------
 
 
+def resolve_database_url() -> str:
+    """
+    Decide which database this project talks to, ignoring unrelated ambient config.
+
+    ``DATABASE_URL`` is a name many tools claim. A developer machine can easily have
+    an exported ``DATABASE_URL`` belonging to a completely different project, and
+    because ``load_dotenv()`` does not override variables that already exist, that
+    foreign value silently wins over this repo's own ``.env``. The failure mode is
+    not a crash -- it is this application running ``create_all`` against someone
+    else's database and quietly creating its tables there.
+
+    Precedence, most specific first:
+
+    1. ``VCC_DATABASE_URL`` -- project-namespaced, cannot be claimed by accident.
+       This is the variable to set for a real deployment.
+    2. ``DATABASE_URL`` -- accepted for compatibility, but see the guard below.
+    3. The built-in SQLite default.
+    """
+    explicit = os.getenv("VCC_DATABASE_URL")
+    if explicit:
+        return explicit
+
+    # This repo's own .env outranks an ambient DATABASE_URL.
+    #
+    # Read from the file directly instead of relying on load_dotenv(), which by
+    # design refuses to overwrite a variable already present in the environment.
+    # A blanket load_dotenv(override=True) would fix this but would also stomp
+    # deliberate command-line overrides of unrelated settings, so the override is
+    # scoped to just this one setting.
+    from_file = _project_env_database_url()
+    if from_file:
+        return from_file
+
+    generic = os.getenv("DATABASE_URL")
+    if generic:
+        logger.warning(
+            "Using DATABASE_URL inherited from the environment (%s). No "
+            "DATABASE_URL was found in this project's .env. If that target is "
+            "not this application's database, set VCC_DATABASE_URL instead.",
+            describe_database_url(generic),
+        )
+        return generic
+
+    return DEFAULT_DATABASE_URL
+
+
+def _project_env_database_url() -> str | None:
+    """DATABASE_URL as written in this repo's backend/.env, or None."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        from dotenv import dotenv_values
+        return dotenv_values(env_path).get("DATABASE_URL") or None
+    except Exception:
+        return None
+
+
+def describe_database_url(url: str) -> str:
+    """Render a URL for logs with any password removed."""
+    try:
+        parsed = make_url(url)
+        if parsed.password:
+            parsed = parsed.set(password="***")
+        return str(parsed)
+    except Exception:
+        return "<unparseable>"
+
+
 def normalize_database_url(url: str | None = None) -> str:
     """Return an async-driver URL with SQLite paths resolved to absolute.
 
@@ -125,7 +192,7 @@ def normalize_database_url(url: str | None = None) -> str:
         postgresql://u:p@h/db         -> postgresql+asyncpg://u:p@h/db
         postgresql+asyncpg://...      -> unchanged
     """
-    raw = url or os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
+    raw = url or resolve_database_url()
     parsed = make_url(raw)
 
     # Split on the string rather than calling get_backend_name()/get_driver_name(),

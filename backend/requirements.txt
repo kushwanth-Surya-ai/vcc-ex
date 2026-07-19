@@ -8,6 +8,10 @@ alembic>=1.13
 pydantic[email]>=2.0
 python-jose[cryptography]>=3.3
 passlib[bcrypt]>=1.7
+# passlib 1.7.4 reads bcrypt.__about__, which bcrypt removed in 4.1. Against
+# bcrypt 5.x every password hash raises and ALL logins fail -- on PostgreSQL too.
+# Pin until passlib ships a release that stops using the private attribute.
+bcrypt<4.1
 slowapi>=0.1.9
 limits>=3.6
 apscheduler>=3.10
