@@ -119,6 +119,63 @@ class CameraRead(CameraBase):
     id: int
     event_count: int = 0
     counting_lines: List[CountingLineRead] = []
+    # Additive only - existing consumers that ignore these keep working. They
+    # let the Live View picker tell a live feed apart from an uploaded video.
+    source_type: str = "live"
+    processing_status: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Uploaded videos
+#
+# A "video" is a Camera row with source_type='upload'; these schemas are just a
+# video-shaped projection of that row, so the detection pipeline stays entirely
+# camera-oriented and needs no notion of uploads at all.
+# ---------------------------------------------------------------------------
+
+
+class VideoRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    location_id: int
+    video_filename: Optional[str] = None
+    video_size_bytes: Optional[int] = None
+    processing_status: Optional[str] = None
+    source_type: str = "upload"
+    status: str = "active"
+    rtsp_url: Optional[str] = None
+    uploaded_at: Optional[datetime] = None
+    processed_at: Optional[datetime] = None
+    event_count: int = 0
+
+
+class VideoCompleteRequest(BaseModel):
+    """Posted by the detection process when a single pass over the file ends."""
+
+    status: str = Field(..., pattern="^(completed|failed)$")
+    detail: Optional[str] = Field(None, max_length=2000)
+
+
+class VideoTimelinePoint(BaseModel):
+    ts: datetime
+    count: int
+
+
+class VideoReport(BaseModel):
+    camera_id: int
+    name: str
+    video_filename: Optional[str] = None
+    processing_status: Optional[str] = None
+    processed_at: Optional[datetime] = None
+    uploaded_at: Optional[datetime] = None
+    first_event_at: Optional[datetime] = None
+    last_event_at: Optional[datetime] = None
+    total_vehicles: int = 0
+    by_class: Dict[str, int] = {}
+    by_direction: Dict[str, int] = {}
+    timeline: List[VideoTimelinePoint] = []
 
 
 

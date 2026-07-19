@@ -46,6 +46,8 @@ async def create_camera(
         latitude=cam.latitude,
         longitude=cam.longitude,
         counting_line=cam.counting_line,
+        source_type=cam.source_type or "live",
+        processing_status=cam.processing_status,
         counting_lines=[],
         event_count=0
     )
@@ -62,6 +64,11 @@ async def list_cameras(
     limit: int = Query(20, ge=1, le=200),
     offset: int = Query(0, ge=0),
     location_id: int | None = Query(None, description="Filter by location"),
+    source_type: str | None = Query(
+        None,
+        pattern="^(live|upload)$",
+        description="Filter by source: 'live' for real cameras, 'upload' for uploaded videos",
+    ),
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_bearer_token),
 ) -> PaginatedResponse[CameraRead]:
@@ -78,6 +85,18 @@ async def list_cameras(
     if location_id is not None:
         base_q = base_q.where(Camera.location_id == location_id)
         count_q = count_q.where(Camera.location_id == location_id)
+
+    if source_type is not None:
+        # Omitting the filter still returns everything, so the existing
+        # response shape and default behaviour are unchanged. Rows predating the
+        # column read as NULL, and a NULL source is a live camera - hence the
+        # explicit IS NULL arm for 'live', which a bare == would drop.
+        if source_type == "live":
+            filter_expr = (Camera.source_type == "live") | (Camera.source_type.is_(None))
+        else:
+            filter_expr = Camera.source_type == source_type
+        base_q = base_q.where(filter_expr)
+        count_q = count_q.where(filter_expr)
 
     total = (await db.execute(count_q)).scalar_one()
     
@@ -96,6 +115,8 @@ async def list_cameras(
             latitude=cam.latitude,
             longitude=cam.longitude,
             counting_line=cam.counting_line,
+            source_type=cam.source_type or "live",
+            processing_status=cam.processing_status,
             counting_lines=[CountingLineRead.model_validate(l) for l in cam.counting_lines],
             event_count=count
         )
@@ -147,6 +168,8 @@ async def get_camera(
         latitude=cam.latitude,
         longitude=cam.longitude,
         counting_line=cam.counting_line,
+        source_type=cam.source_type or "live",
+        processing_status=cam.processing_status,
         counting_lines=[CountingLineRead.model_validate(l) for l in cam.counting_lines],
         event_count=count
     )
@@ -195,6 +218,8 @@ async def update_camera(
         latitude=row.latitude,
         longitude=row.longitude,
         counting_line=row.counting_line,
+        source_type=row.source_type or "live",
+        processing_status=row.processing_status,
         counting_lines=[CountingLineRead.model_validate(l) for l in row.counting_lines],
         event_count=count
     )

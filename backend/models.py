@@ -104,6 +104,22 @@ class Camera(Base):
     longitude = Column(Float, nullable=True)
     counting_line = Column(String(255), nullable=True)
 
+    # --- Uploaded-video support -------------------------------------------
+    # An uploaded video is not a second kind of entity: it is a Camera whose
+    # rtsp_url happens to be an absolute path on disk. That is what lets the
+    # existing detection supervisor pick it up on its normal 5-second poll and
+    # give it overlays, streaming and counting with no separate inference path.
+    # These columns only describe *where the pixels came from*; everything
+    # downstream stays camera-shaped.
+    source_type = Column(
+        String(16), nullable=False, default="live", server_default="live"
+    )
+    # NULL for live cameras - a live feed never "finishes".
+    processing_status = Column(String(16), nullable=True)
+    video_filename = Column(String(255), nullable=True)
+    video_size_bytes = Column(BigInteger, nullable=True)
+    uploaded_at = Column(UtcDateTime, nullable=True)
+    processed_at = Column(UtcDateTime, nullable=True)
 
     location: "Location" = relationship("Location", back_populates="cameras")
     events: list["Event"] = relationship("Event", back_populates="camera", cascade="all, delete-orphan", passive_deletes=True)

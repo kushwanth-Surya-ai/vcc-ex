@@ -20,6 +20,9 @@ python-dotenv>=1.0
 pytest>=8.0
 pytest-asyncio>=0.23
 aiofiles>=23.0
+# Required by FastAPI to parse multipart/form-data (POST /api/videos/upload).
+# FastAPI raises at request time, not import time, without it.
+python-multipart>=0.0.9
 psutil>=6.0
 # Training-only (port 8002 / training_worker.py). The live app on port 8000
 # must never import this — see training_paths.py.

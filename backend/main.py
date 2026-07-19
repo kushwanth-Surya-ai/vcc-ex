@@ -70,36 +70,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Auto-create tables (e.g. audit_logs and login_logs) on startup
     from database import engine
     from models import Base
-    from sqlalchemy import Float, String, inspect, text
-    from db_dialect import UtcDateTime, create_analytics_views
-
-    # Columns added after the initial schema shipped. Declared with SQLAlchemy
-    # types rather than raw SQL so each dialect renders its own spelling -
-    # SQLite has no TIMESTAMP WITH TIME ZONE and rejects ADD COLUMN IF NOT
-    # EXISTS, so we inspect first and only add what is genuinely missing.
-    _CAMERA_UPGRADE_COLUMNS = (
-        ("latitude", Float()),
-        ("longitude", Float()),
-        ("last_seen_at", UtcDateTime()),
-        ("counting_line", String(255)),
-    )
+    from sqlalchemy import text
+    from db_dialect import apply_camera_upgrades, create_analytics_views
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-        # Schema shape is not optional: if this fails the app is broken, so it
-        # is deliberately NOT wrapped in a warn-and-continue handler.
-        existing = {
-            c["name"]
-            for c in await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_columns("cameras"))
-        }
+        # create_all() adds missing TABLES but never missing COLUMNS, so a
+        # database that predates a schema addition needs the ALTERs applied
+        # explicitly. The column list lives in db_dialect so the test suites can
+        # bring their own long-lived databases up to date the same way.
+        await apply_camera_upgrades(conn)
+
         dialect = conn.engine.dialect
-        for col_name, col_type in _CAMERA_UPGRADE_COLUMNS:
-            if col_name in existing:
-                continue
-            ddl_type = col_type.compile(dialect=dialect)
-            await conn.execute(text(f"ALTER TABLE cameras ADD COLUMN {col_name} {ddl_type}"))
-            logger.info("Added missing cameras.%s column (%s)", col_name, ddl_type)
 
         # Analytics views (mv_*). Alembic is bypassed in practice - the real
         # schema path is create_all + this block - so the views must be created
@@ -254,7 +237,7 @@ app.add_middleware(SlowAPIMiddleware)
 # Routers
 # ---------------------------------------------------------------------------
 
-from routers import health, analytics, settings, counting_lines  # noqa: E402
+from routers import health, analytics, settings, counting_lines, videos  # noqa: E402
 from routers import auth as auth_router  # noqa: E402
 from routers import cameras, events, locations, users  # noqa: E402
 from routers import alerts as alerts_router  # noqa: E402
@@ -269,6 +252,7 @@ app.include_router(alerts_router.router)
 app.include_router(users.router)
 app.include_router(settings.router)
 app.include_router(counting_lines.router)
+app.include_router(videos.router)
 
 
 

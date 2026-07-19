@@ -39,15 +39,18 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     Column,
     Date,
     DateTime,
+    Float,
     Integer,
     MetaData,
     String,
     Table,
     TypeDecorator,
     event,
+    inspect,
     literal_column,
     text,
 )
@@ -354,6 +357,69 @@ def _compile_date_trunc_sqlite(element, compiler, **kw):
     if fmt is None:
         raise ValueError("Unsupported date_trunc() unit on SQLite: %r" % (unit,))
     return "strftime('%s', %s)" % (fmt, ts_sql)
+
+
+# ---------------------------------------------------------------------------
+# Additive schema upgrades
+# ---------------------------------------------------------------------------
+
+#: Columns added to `cameras` after the initial schema shipped, in the order
+#: they were introduced.
+#:
+#: This list exists because ``Base.metadata.create_all()`` creates *missing
+#: tables* and nothing else - it will never add a column to a table that already
+#: exists. Any database created before one of these columns landed (a long-lived
+#: vcc.db, or a cached test database under the system temp directory) therefore
+#: keeps the old shape and fails at the first INSERT with "table cameras has no
+#: column named ...". Applying these ALTERs is what closes that gap.
+#:
+#: The third element is extra DDL appended after the type. It exists for
+#: source_type, which is NOT NULL: a bare ADD COLUMN would leave every existing
+#: row NULL and violate the constraint immediately, so the DEFAULT is what
+#: backfills them as 'live'. Both dialects accept "NOT NULL DEFAULT <constant>".
+#:
+#: Types are SQLAlchemy types, not raw SQL strings, so each dialect renders its
+#: own spelling - SQLite has no TIMESTAMP WITH TIME ZONE.
+CAMERA_UPGRADE_COLUMNS: tuple[tuple[str, Any, str], ...] = (
+    ("latitude", Float(), ""),
+    ("longitude", Float(), ""),
+    ("last_seen_at", UtcDateTime(), ""),
+    ("counting_line", String(255), ""),
+    # --- uploaded-video support ---
+    ("source_type", String(16), "NOT NULL DEFAULT 'live'"),
+    ("processing_status", String(16), ""),
+    ("video_filename", String(255), ""),
+    ("video_size_bytes", BigInteger(), ""),
+    ("uploaded_at", UtcDateTime(), ""),
+    ("processed_at", UtcDateTime(), ""),
+)
+
+
+async def apply_camera_upgrades(conn: AsyncConnection) -> None:
+    """Add any CAMERA_UPGRADE_COLUMNS the `cameras` table is missing.
+
+    Idempotent, and safe to run on every startup. We inspect first and add only
+    what is genuinely absent because SQLite rejects ``ADD COLUMN IF NOT EXISTS``.
+
+    Deliberately not wrapped in a warn-and-continue handler: schema shape is not
+    optional. If this fails the application cannot serve requests correctly, and
+    a silent warning would turn that into a confusing runtime error much later.
+    """
+    existing = {
+        c["name"]
+        for c in await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_columns("cameras"))
+    }
+    dialect = conn.engine.dialect
+
+    for col_name, col_type, col_extra in CAMERA_UPGRADE_COLUMNS:
+        if col_name in existing:
+            continue
+        ddl_type = col_type.compile(dialect=dialect)
+        ddl = "ALTER TABLE cameras ADD COLUMN %s %s" % (col_name, ddl_type)
+        if col_extra:
+            ddl += " " + col_extra
+        await conn.execute(text(ddl))
+        logger.info("Added missing cameras.%s column (%s)", col_name, ddl_type)
 
 
 # ---------------------------------------------------------------------------

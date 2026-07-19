@@ -65,7 +65,11 @@ from models import Alert, Camera, Event, Location, User  # noqa: E402
 # Test database engine & session
 # ---------------------------------------------------------------------------
 
-from db_dialect import create_analytics_views, create_engine_from_url  # noqa: E402
+from db_dialect import (  # noqa: E402
+    apply_camera_upgrades,
+    create_analytics_views,
+    create_engine_from_url,
+)
 
 TEST_DATABASE_URL: str = os.environ["DATABASE_URL"]
 
@@ -94,6 +98,11 @@ async def setup_database():
     """Create all tables and seed test data once per session."""
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # This database file is reused across runs, and create_all() adds
+        # missing tables but never missing columns. Without the same upgrade the
+        # app applies at startup, a database cached from before a schema
+        # addition fails every insert with "table cameras has no column named".
+        await apply_camera_upgrades(conn)
         # Same dialect-aware view DDL the application runs at startup.
         await create_analytics_views(conn)
 
