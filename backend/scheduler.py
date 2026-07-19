@@ -58,14 +58,23 @@ async def check_camera_status() -> None:
         ).values(status=CameraStatus.inactive.value)
         await conn.execute(stmt)
 
+def _write_bytes(path: str, data: bytes) -> None:
+    """Blocking file write, intended to be run in a thread executor."""
+    with open(path, "wb") as f:
+        f.write(data)
+
+
 async def auto_capture_frames() -> None:
     """Automatically capture snapshot frames from active cameras periodically."""
+    import asyncio
     import httpx
     import time
     from sqlalchemy import select
     from models import Camera, CameraStatus
-    from routers.training import IMAGES_DIR, LABELS_DIR, STREAM_BASE_URL
-    
+    # Import from the neutral config module, NOT routers.training — that module
+    # pulls in ultralytics/torch and must never load in the live-processing app.
+    from training_paths import IMAGES_DIR, LABELS_DIR, STREAM_BASE_URL
+
     os.makedirs(IMAGES_DIR, exist_ok=True)
     
     # 1. Fetch active cameras
@@ -103,8 +112,11 @@ async def auto_capture_frames() -> None:
                     timestamp = int(time.time())
                     filename = f"img_{timestamp}.jpg"
                     filepath = os.path.join(IMAGES_DIR, filename)
-                    with open(filepath, "wb") as f:
-                        f.write(response.content)
+                    # Disk write off the event loop — this job shares the loop
+                    # with live camera/WebSocket traffic.
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, _write_bytes, filepath, response.content
+                    )
                     logger.info("Auto-captured frame for camera %s", cam_id)
                     break
             except Exception:

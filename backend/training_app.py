@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Starting VCC Training Dedicated Server on Port 8002...")
     yield
+    # Kill any in-flight training subprocess before we go down.
+    from routers.training import shutdown_training
+    shutdown_training()
     # Close SQLAlchemy engine connection pool
     from database import engine
     await engine.dispose()

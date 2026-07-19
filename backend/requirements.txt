@@ -15,4 +15,7 @@ pytest>=8.0
 pytest-asyncio>=0.23
 aiofiles>=23.0
 psutil>=6.0
+# Training-only (port 8002 / training_worker.py). The live app on port 8000
+# must never import this — see training_paths.py.
+ultralytics>=8.3
 

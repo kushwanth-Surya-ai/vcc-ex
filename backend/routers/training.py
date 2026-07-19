@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import os
 import re
 import shutil
@@ -18,41 +19,33 @@ from database import get_db
 from models import UserRole, Camera
 from auth import require_bearer_token
 
+# Shared, dependency-free path/URL constants. Also imported by scheduler.py so
+# that the live app never has to import this (ultralytics-dependent) module.
+from training_paths import (  # noqa: F401 - re-exported for backwards compatibility
+    BASE_DIR,
+    IMAGES_DIR,
+    LABELS_DIR,
+    MIN_LABELED_IMAGES,
+    SPLIT_DIR,
+    STREAM_BASE_URL,
+    TRAINED_MODEL_DIR,
+    VCC_AUTO_TRAIN_THRESHOLD,
+)
+
+# Subprocess lifecycle manager (stdlib-only; owns the global TrainingState).
+from training_process import (  # noqa: F401 - re-exported for tests/compatibility
+    TrainingState,
+    _state,
+    append_log_locked as _append_log_locked,
+    shutdown_training,
+    spawn_training as _spawn_training,
+    terminate_process as _terminate_process,
+)
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/training", tags=["training"])
 
-# ---------------------------------------------------------------------------
-# Directories & Constants
-# ---------------------------------------------------------------------------
-BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "training_data")
-IMAGES_DIR = os.path.join(BASE_DIR, "images")
-LABELS_DIR = os.path.join(BASE_DIR, "labels")
-SPLIT_DIR = os.path.join(BASE_DIR, "split")
-
-os.makedirs(IMAGES_DIR, exist_ok=True)
-os.makedirs(LABELS_DIR, exist_ok=True)
-
-STREAM_BASE_URL = os.getenv("STREAM_BASE_URL", "http://localhost:8001")
-MIN_LABELED_IMAGES = int(os.getenv("VCC_MIN_LABELED_IMAGES", "5"))
-VCC_AUTO_TRAIN_THRESHOLD = int(os.getenv("VCC_AUTO_TRAIN_THRESHOLD", "50"))
-
-
-# ---------------------------------------------------------------------------
-# Global Training State
-# ---------------------------------------------------------------------------
-class TrainingState:
-    def __init__(self):
-        self.status = "idle"  # idle | training | complete | failed
-        self.current_epoch = 0
-        self.total_epochs = 0
-        self.metrics: Dict[str, float] = {}
-        self.logs: List[str] = []
-        self.cancel_requested = False
-        self.new_model_name: Optional[str] = None
-        self._lock = threading.Lock()
-
-_state = TrainingState()
 
 # ---------------------------------------------------------------------------
 # Pydantic Schemas
@@ -378,8 +371,16 @@ async def save_label(
             for box in body.boxes:
                 # YOLO format: class x_center y_center width height
                 f.write(f"{box.class_id} {box.x_center:.6f} {box.y_center:.6f} {box.width:.6f} {box.height:.6f}\n")
-                
-        # ---- Automatic training check ----------------------------------------
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to write label file: {e}"
+        )
+
+    # ---- Automatic training check --------------------------------------------
+    # Deliberately OUTSIDE the try above: a failure here is not a label-write
+    # failure and must not be misreported as one.
+    try:
         all_images = [file for file in os.listdir(IMAGES_DIR) if file.endswith(".jpg")]
         labeled_count = 0
         for f in all_images:
@@ -387,101 +388,49 @@ async def save_label(
             lbl = os.path.join(LABELS_DIR, f"{b}.txt")
             if os.path.exists(lbl) and os.path.getsize(lbl) > 0:
                 labeled_count += 1
-                
+
         if labeled_count >= VCC_AUTO_TRAIN_THRESHOLD:
             # Check concurrency
             is_idle = False
             with _state._lock:
                 if _state.status != "training":
                     is_idle = True
-            
+
             if is_idle:
                 logger.info("Labeled images threshold reached (%d/%d). Auto-triggering model training...", labeled_count, VCC_AUTO_TRAIN_THRESHOLD)
-                # Run the helper function asynchronously (fire-and-forget)
-                asyncio.create_task(_trigger_training_job_impl(db, epochs=10, batch_size=8, force=True, triggered_by="auto_trigger"))
-
-        return {"status": "ok", "message": "Annotations saved successfully"}
+                # Fire-and-forget on its own DB session: the request-scoped `db`
+                # is closed as soon as this handler returns.
+                task = asyncio.create_task(_auto_trigger_training())
+                _AUTO_TRAIN_TASKS.add(task)
+                task.add_done_callback(_AUTO_TRAIN_TASKS.discard)
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to write label file: {e}"
-        )
+        # Never fail the save because the auto-train probe misfired.
+        logger.warning("Auto-train check failed after saving label: %s", e)
+
+    return {"status": "ok", "message": "Annotations saved successfully"}
 
 
-# ---------------------------------------------------------------------------
-# Training Engine thread
-# ---------------------------------------------------------------------------
-def run_yolo_train(epochs: int, batch_size: int, data_yaml_path: str, new_model_path: str, versioned_name: str):
-    from ultralytics import YOLO
-    import torch
-    
+#: Strong refs to fire-and-forget auto-train tasks (asyncio only holds weak refs).
+_AUTO_TRAIN_TASKS: set = set()
+
+
+async def _auto_trigger_training() -> None:
+    """Background auto-train launch using a fresh, independent DB session."""
+    from database import AsyncSessionLocal
     try:
-        # Load lightweight base model for fast CPU/GPU fine-tuning
-        base_model_name = os.getenv("VCC_TRAIN_BASE_MODEL", "yolo11n.pt")
-        model = YOLO(base_model_name)
-        
-        # Add custom callbacks to report stats & handle cancellation
-        def on_train_epoch_end(trainer):
-            with _state._lock:
-                _state.current_epoch = trainer.epoch + 1
-                # Grab metrics
-                loss = float(trainer.loss.item() if hasattr(trainer.loss, "item") else trainer.loss)
-                _state.metrics = {"loss": loss}
-                _state.logs.append(f"Epoch {_state.current_epoch}/{_state.total_epochs} completed. Loss: {loss:.4f}")
-                
-        def on_train_batch_end(trainer):
-            if _state.cancel_requested:
-                raise RuntimeError("TRAINING_CANCELLED")
-                
-        model.add_callback("on_train_epoch_end", on_train_epoch_end)
-        model.add_callback("on_train_batch_end", on_train_batch_end)
-        
-        # Determine optimal compute device & worker threads
-        device = 0 if torch.cuda.is_available() else "cpu"
-        num_workers = min(4, max(1, (os.cpu_count() or 2) // 2))
-        imgsz = int(os.getenv("VCC_TRAIN_IMGSZ", "480"))
-        
-        _state.logs.append(f"Initializing {base_model_name} training on device='{device}' (imgsz={imgsz}, workers={num_workers})...")
-        
-        # Fast Train
-        model.train(
-            data=data_yaml_path,
-            epochs=epochs,
-            imgsz=imgsz,
-            batch=batch_size,
-            device=device,
-            workers=num_workers,
-            plots=False,
-            verbose=False
-        )
-        
-        # Copy weights
-        best_weights = os.path.join("runs", "detect", "train", "weights", "best.pt")
-        if os.path.exists(best_weights):
-            shutil.copy(best_weights, new_model_path)
-            _state.status = "complete"
-            _state.new_model_name = versioned_name
-            _state.logs.append(f"SUCCESS: Training complete! New model saved to: {versioned_name}")
-        else:
-            raise FileNotFoundError("Could not locate trained weights best.pt file")
-            
-    except Exception as e:
-        if "TRAINING_CANCELLED" in str(e):
-            _state.status = "cancelled"
-            _state.logs.append("CANCELLED: Training cancelled by user.")
-        else:
-            _state.status = "failed"
-            _state.logs.append(f"ERROR: Training failed: {e}")
-            logger.error("YOLO Training failed: %s", e)
-    finally:
-        # Cleanup runs directory safely
-        try:
-            if os.path.exists("runs"):
-                shutil.rmtree("runs", ignore_errors=True)
-        except Exception:
-            pass
+        async with AsyncSessionLocal() as session:
+            res = await _trigger_training_job_impl(
+                session, epochs=10, batch_size=8, force=True, triggered_by="auto_trigger"
+            )
+        if res.get("status") == "error":
+            logger.warning("Auto-triggered training did not start: %s", res.get("message"))
+    except Exception:
+        logger.exception("Auto-triggered training failed to launch")
 
 
+# ---------------------------------------------------------------------------
+# Training job orchestration
+# ---------------------------------------------------------------------------
 async def _trigger_training_job_impl(
     db: AsyncSession,
     epochs: int,
@@ -581,16 +530,18 @@ async def _trigger_training_job_impl(
         for lbl in labels_list:
             f.write(f"  {lbl['id']}: {lbl['name']}\n")
 
-    # 5. Determine next versioned model file name
+    # 5. Determine next versioned model file name.
+    #    NOTE: this used to write to backend/detection/ (a directory that does
+    #    not exist). The detection process resolves VCC_MODEL_PATH relative to
+    #    the repo root, so weights are published there. See training_paths.py.
+    os.makedirs(TRAINED_MODEL_DIR, exist_ok=True)
     v = 1
-    # Check current directory files
-    detection_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "detection")
-    while os.path.exists(os.path.join(detection_dir, f"yolo11s_custom_v{v}.pt")):
+    while os.path.exists(os.path.join(TRAINED_MODEL_DIR, f"yolo11s_custom_v{v}.pt")):
         v += 1
     versioned_name = f"yolo11s_custom_v{v}.pt"
-    new_model_path = os.path.join(detection_dir, versioned_name)
+    new_model_path = os.path.join(TRAINED_MODEL_DIR, versioned_name)
 
-    # 6. Initialize State & Start Training Thread
+    # 6. Initialize State & launch the isolated training SUBPROCESS
     with _state._lock:
         _state.status = "training"
         _state.current_epoch = 0
@@ -599,14 +550,23 @@ async def _trigger_training_job_impl(
         _state.logs = ["Starting dataset preparation...", f"Total train files: {len(train_set)}, val files: {len(val_set)}"]
         _state.cancel_requested = False
         _state.new_model_name = None
-        
-        thread = threading.Thread(
-            target=run_yolo_train,
-            args=(epochs, batch_size, data_yaml, new_model_path, versioned_name)
-        )
-        _state.thread = thread
-        thread.start()
-        
+        _state.stderr_tail.clear()
+
+        try:
+            _state.process = _spawn_training(
+                epochs, batch_size, data_yaml, new_model_path, versioned_name
+            )
+        except Exception as e:
+            _state.status = "failed"
+            _state.process = None
+            _append_log_locked(f"ERROR: Could not start training subprocess: {e}")
+            logger.exception("Failed to spawn training subprocess")
+            return {"status": "error", "message": f"Could not start training subprocess: {e}"}
+
+    logger.info(
+        "Training subprocess started (pid=%s) -> %s", _state.process.pid if _state.process else "?", new_model_path
+    )
+
     # Log audit event
     from audit import log_action
     await log_action(
@@ -678,11 +638,17 @@ async def cancel_training(
     with _state._lock:
         if _state.status != "training":
             return {"status": "ok", "message": "No active training job found to cancel"}
-            
+
         _state.cancel_requested = True
         _state.status = "cancelled"
-        _state.logs.append("Cancellation requested by administrator. Aborting...")
-        
+        _append_log_locked("Cancellation requested by administrator. Aborting...")
+        proc = _state.process
+
+    # Actually kill the worker. Done off the event loop so the endpoint returns
+    # immediately even if the process needs the full grace period + SIGKILL.
+    if proc is not None:
+        threading.Thread(target=_terminate_process, args=(proc,), daemon=True).start()
+
     # Log audit event safely without raising 500 errors if audit table commit fails
     try:
         from audit import log_action
