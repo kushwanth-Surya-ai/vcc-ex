@@ -39,10 +39,12 @@ export default function CountingLineEditor({ camera, onClose, onSaved }) {
     const nw = img?.naturalWidth || 0
     const nh = img?.naturalHeight || 0
 
-    // Before the first frame arrives (or when the stream is offline) there is no
-    // frame to align to, so fall back to the full container.
+    // Before the first frame arrives (or when the stream is offline) the true frame
+    // size is unknown. Falling back to the container silently reintroduces exactly
+    // the letterbox error this mapping exists to prevent, so the rect is flagged
+    // `known: false` and drawing is disabled until real dimensions arrive.
     if (!nw || !nh) {
-      setFrameRect({ left: 0, top: 0, width: cw, height: ch })
+      setFrameRect({ left: 0, top: 0, width: cw, height: ch, known: false })
       return
     }
 
@@ -55,8 +57,13 @@ export default function CountingLineEditor({ camera, onClose, onSaved }) {
       top: (ch - height) / 2,
       width,
       height,
+      known: true,
     })
   }, [])
+
+  // True once the real frame dimensions are known. Until then any coordinate we
+  // derive would be measured against the wrong box, so editing is blocked.
+  const frameReady = !!frameRect?.known
 
   useEffect(() => {
     measureFrame()
@@ -112,6 +119,8 @@ export default function CountingLineEditor({ camera, onClose, onSaved }) {
 
   const handleMouseDown = (e) => {
     if (draggingEndpoint) return
+    // Refuse to start a line we cannot position accurately.
+    if (!frameReady) return
     const { x, y } = getRelativeCoords(e)
     setIsDrawing(true)
     setDrawStart({ x, y })
@@ -119,6 +128,7 @@ export default function CountingLineEditor({ camera, onClose, onSaved }) {
   }
 
   const handleMouseMove = (e) => {
+    if (!frameReady) return
     const { x, y } = getRelativeCoords(e)
 
     if (draggingEndpoint) {
@@ -271,12 +281,24 @@ export default function CountingLineEditor({ camera, onClose, onSaved }) {
         {/* Drawing Canvas */}
         <div
           ref={containerRef}
-          className="relative border border-bg-border rounded-lg bg-black aspect-video overflow-hidden cursor-crosshair select-none"
+          className={`relative border border-bg-border rounded-lg bg-black aspect-video overflow-hidden select-none ${
+            frameReady ? 'cursor-crosshair' : 'cursor-not-allowed'
+          }`}
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
           onMouseLeave={handleMouseUp}
         >
+          {/* Until the true frame size is known, a drawn line cannot be positioned
+              correctly, so drawing is blocked and the reason is stated rather than
+              silently saving coordinates measured against the wrong box. */}
+          {!frameReady && !streamError && (
+            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/60 pointer-events-none">
+              <span className="text-xs text-amber-300 font-medium px-3 py-1.5 rounded bg-black/70 text-center">
+                Waiting for video — drawing is disabled until the frame size is known
+              </span>
+            </div>
+          )}
           {!streamError ? (
             <img
               ref={imgRef}

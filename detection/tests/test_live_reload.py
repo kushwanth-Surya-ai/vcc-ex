@@ -85,20 +85,34 @@ def test_vehicle_in_frame_is_not_recounted_after_unrelated_line_edit():
         "vehicle already counted on line 1 was counted a second time"
 
 
-def test_moved_line_allows_recount_at_new_position():
+def test_moved_line_does_not_recount_an_already_counted_vehicle():
     """
-    A line dragged elsewhere is a different measurement point. A vehicle counted at
-    the old position has genuinely not crossed the new one, so it must be eligible.
+    Nudging a line must never produce a duplicate event.
+
+    An earlier implementation cleared the dedup set whenever geometry changed, so a
+    one-pixel drag made every already-counted vehicle on screen eligible again --
+    and each had already been POSTed to /api/events, writing duplicate rows.
+    Dedup means "already counted at this line" and survives the line moving.
     """
     c = _counter([_line(1, y=0.5)])
     assert len(_cross(c, 3, 400, 600)) == 1
     assert 3 in c.counted_down_per_line[1]
 
-    c.update_lines([_line(1, y=0.9)])                 # drag the line down
+    c.update_lines([_line(1, y=0.51)])                # barely nudge the line
 
-    assert 3 not in c.counted_down_per_line[1], "moved line must clear stale dedup"
+    assert 3 in c.counted_down_per_line[1], "moved line must retain its dedup set"
     events = _cross(c, 3, 850, 950)
-    assert len(events) == 1, "vehicle should be countable at the line's new position"
+    assert not events, "a nudge re-counted a vehicle that was already counted"
+
+
+def test_new_vehicles_still_count_at_a_moved_line():
+    """The flip side: relocating a line must not disable it for fresh traffic."""
+    c = _counter([_line(1, y=0.5)])
+    _cross(c, 4, 400, 600)
+    c.update_lines([_line(1, y=0.9)])
+
+    events = _cross(c, 99, 850, 950)                  # a vehicle never seen before
+    assert len(events) == 1, "moved line stopped counting new vehicles"
 
 
 def test_tracking_identity_survives_reload():

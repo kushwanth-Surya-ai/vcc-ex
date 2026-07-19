@@ -151,8 +151,10 @@ class LineCounter:
 
         This applies the change in place. ``prev_centroids`` and ``_frames_missing``
         are untouched, so in-flight tracks keep their identity and their crossing
-        history. Dedup sets are preserved for surviving line ids and dropped only
-        for lines the user actually deleted.
+        history. Dedup sets are preserved for every surviving line id -- including
+        lines whose geometry moved -- and dropped only for lines the user actually
+        deleted. A vehicle already counted is therefore never counted twice, whatever
+        the edit.
 
         Returns
         -------
@@ -192,28 +194,38 @@ class LineCounter:
             self.lines = list(new_lines)
             return False
 
-        surviving = set(new_geom) & set(old_geom)
-        # A line whose geometry moved is effectively a new line: a vehicle already
-        # counted against its old position has not crossed the new one, so its dedup
-        # entry must be cleared or it would never be counted at the new position.
-        moved = {lid for lid in surviving if old_geom[lid] != new_geom[lid]}
+        moved = {lid for lid in set(new_geom) & set(old_geom)
+                 if old_geom[lid] != new_geom[lid]}
 
         self.lines = list(new_lines)
 
+        # A moved line KEEPS its dedup set.
+        #
+        # An earlier version cleared it, reasoning that a relocated line is a new
+        # measurement point. That was wrong in practice: nudging a line by one pixel
+        # made every already-counted vehicle still on screen eligible again, and each
+        # one had already been POSTed to /api/events -- so a trivial drag wrote
+        # duplicate rows into the events table and permanently skewed reports.
+        #
+        # Dedup means "this vehicle has already been counted at this line". That
+        # holds regardless of how far the line subsequently moves. The cost is that
+        # vehicles in frame at the moment of a large move are not re-counted at the
+        # new position; they retire within `retire_after_frames` and traffic arriving
+        # afterwards counts normally. Missing a few counts for a second or two is
+        # recoverable. Duplicate rows in the events table are not.
         for lid in list(self.counted_down_per_line):
-            if lid not in new_geom or lid in moved:
+            if lid not in new_geom:
                 del self.counted_down_per_line[lid]
         for lid in list(self.counted_up_per_line):
-            if lid not in new_geom or lid in moved:
+            if lid not in new_geom:
                 del self.counted_up_per_line[lid]
 
         for lid in new_geom:
             self.counted_down_per_line.setdefault(lid, set())
             self.counted_up_per_line.setdefault(lid, set())
 
-        # Drop display tallies for deleted lines only. A *moved* line keeps its
-        # tally so the on-screen number never jumps backward mid-session; its dedup
-        # set is still cleared above, so vehicles remain countable at the new spot.
+        # Display tallies are dropped for deleted lines only, so an on-screen count
+        # never jumps backward while its line still exists.
         for lid in list(self._tally_down):
             if lid not in new_geom:
                 del self._tally_down[lid]
@@ -404,7 +416,15 @@ class LineCounter:
         return False
 
     def line_totals(self, line_id: int) -> tuple[int, int]:
-        """Monotonic (down, up) counts for one line, safe for on-screen display."""
+        """
+        Monotonic (down, up) crossing counts for one line, safe for on-screen display.
+
+        These count CROSSINGS OF THIS LINE. ``total_down`` / ``total_up`` count
+        DISTINCT VEHICLES across all lines. The two deliberately disagree when a
+        camera has more than one line: a vehicle crossing three lines contributes
+        3 to the sum of per-line tallies but 1 to the total. Do not compare them or
+        expect ``sum(line_totals) == total_down``.
+        """
         return self._tally_down.get(line_id, 0), self._tally_up.get(line_id, 0)
 
     @property
